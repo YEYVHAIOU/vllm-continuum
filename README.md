@@ -1,6 +1,8 @@
 # vLLM with Continuum Scheduling
 
-This repository contains a modified version of vLLM with Continuum-style scheduling support (without the estimation in the paper) for improved inference performance. For multi-node support, you should use sticky-session routing. You can use this as a base-repo to tune KV cache pin logic on different workloads.
+This repository contains a modified version of vLLM with Continuum-style scheduling support (without the estimation in the paper) for improved inference performance. For multi-node support, you should use sticky-session routing. 
+
+You can use this as a base-repo to tune KV cache pin logic on different workloads.
 
 ## Table of Contents
 
