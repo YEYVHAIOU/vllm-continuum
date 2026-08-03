@@ -1,6 +1,12 @@
 from vllm.v1.request import Request
+from vllm.v1.core.dynamic_ttl_estimator import (
+    DynamicTTLEstimator,
+    PiecewiseLinearPrefillReloadProfile,
+)
 from typing import Optional
 import time
+import math
+import os
 import re
 from vllm.logger import init_logger
 from vllm.transformers_utils.tokenizer import AnyTokenizer, get_tokenizer
@@ -105,7 +111,79 @@ class ToolCallEstimator:
         self.record_func_call_to_exec_time: dict[str, list[float]] = {}
 
         self.job_to_history: dict[str, list[dict[str, float]]] = {}
-
+        self.job_request_counts: dict[str, int] = {}
+        # CONTINUUM_PREFILL_PROFILE_SCALE_V1
+        base_prefill_profile_points = (
+            (0, 0.000000000),
+            (512, 0.016206744),
+            (1024, 0.038612129),
+            (2048, 0.095269512),
+            (3072, 0.164592375),
+            (4000, 0.234015222),
+        )
+        raw_profile_scale = os.environ.get(
+            "CONTINUUM_PREFILL_PROFILE_SCALE", "1.0"
+        )
+        try:
+            profile_scale = float(raw_profile_scale)
+        except ValueError as exc:
+            raise ValueError(
+                "CONTINUUM_PREFILL_PROFILE_SCALE must be a positive number, "
+                f"got {raw_profile_scale!r}"
+            ) from exc
+        if not math.isfinite(profile_scale) or profile_scale <= 0.0:
+            raise ValueError(
+                "CONTINUUM_PREFILL_PROFILE_SCALE must be finite and > 0, "
+                f"got {profile_scale!r}"
+            )
+        scaled_prefill_profile_points = tuple(
+            (tokens, seconds * profile_scale)
+            for tokens, seconds in base_prefill_profile_points
+        )
+        # CONTINUUM_TTL_COUNTERFACTUAL_DIAGNOSTIC_V1
+        self.prefill_profile_scale = profile_scale
+        self.base_prefill_reload_profile = PiecewiseLinearPrefillReloadProfile(
+            points=base_prefill_profile_points
+        )
+        raw_diagnostic_scales = os.environ.get(
+            "CONTINUUM_TTL_DIAGNOSTIC_SCALES", ""
+        ).strip()
+        diagnostic_scales: list[float] = []
+        if raw_diagnostic_scales:
+            for raw_scale in raw_diagnostic_scales.split(","):
+                raw_scale = raw_scale.strip()
+                if not raw_scale:
+                    continue
+                try:
+                    diagnostic_scale = float(raw_scale)
+                except ValueError as exc:
+                    raise ValueError(
+                        "CONTINUUM_TTL_DIAGNOSTIC_SCALES must be a "
+                        "comma-separated list of positive numbers, "
+                        f"got {raw_diagnostic_scales!r}"
+                    ) from exc
+                if (
+                    not math.isfinite(diagnostic_scale)
+                    or diagnostic_scale <= 0.0
+                ):
+                    raise ValueError(
+                        "CONTINUUM_TTL_DIAGNOSTIC_SCALES entries must "
+                        f"be finite and > 0, got {diagnostic_scale!r}"
+                    )
+                diagnostic_scales.append(diagnostic_scale)
+        self.ttl_diagnostic_scales = tuple(
+            sorted(set(diagnostic_scales))
+        )
+        logger.info(
+            "Continuum prefill profile scale=%.3f, points=%s",
+            profile_scale,
+            scaled_prefill_profile_points,
+        )
+        self.dynamic_ttl_estimator = DynamicTTLEstimator(
+            prefill_reload_profile=PiecewiseLinearPrefillReloadProfile(
+                points=scaled_prefill_profile_points
+            )
+        )
         # Initialize tokenizer
         if tokenizer is not None:
             self.tokenizer = tokenizer
@@ -134,37 +212,138 @@ class ToolCallEstimator:
     
     #TODO Hanchen This is currently just an average 
     def update_func_call_exec_time(self, job_id: str) -> None:
-        #this is called when the func call is back again in scheduler.py, update the exec time with last_func_call
-        last_departure_time = self.job_to_history[job_id][-1]["departure_time"]
+        # Called when the next request of the same job arrives.
+        last_departure_time = self.job_to_history[job_id][-1][
+            "departure_time"
+        ]
         func = self.job_to_history[job_id][-1]["func_call"]
-        exec_time = time.time() - last_departure_time
+        if func is None:
+            return
+
+        exec_time = max(0.0, time.time() - last_departure_time)
 
         if func not in self.record_func_call_to_exec_time:
             self.record_func_call_to_exec_time[func] = [exec_time]
         else:
             self.record_func_call_to_exec_time[func].append(exec_time)
-        self.func_call_to_exec_time[func] = sum(self.record_func_call_to_exec_time[func]) / len(self.record_func_call_to_exec_time[func])
-        return 
-    
+
+        records = self.record_func_call_to_exec_time[func]
+        self.func_call_to_exec_time[func] = sum(records) / len(records)
+        self.dynamic_ttl_estimator.record_tool_duration(func, exec_time)
+
     #Functions below will be called by outside functions
     def set_up_pin(self, request: Request) -> float:
         if request.this_func_call is None:
-            return 0
-        
-        this_func_call_exec_time = self.get_func_call_exec_time(request.this_func_call) or 0.0
+            return 0.0
 
-        if this_func_call_exec_time > FIXED_THRESHOLD_CONTINUUM:
-            return 0
-        
-        return FIXED_THRESHOLD_CONTINUUM
+        result = self.dynamic_ttl_estimator.estimate_ttl(
+            request.this_func_call,
+            context_tokens=request.num_prompt_tokens,
+        )
+        logger.info(
+            "Continuum dynamic TTL request=%s job=%s tool=%s "
+            "ttl=%.6f source=%s score=%.6f probability=%.6f "
+            "queue_delay=%.6f memoryfulness=%.6f "
+            "prefill_reload=%.6f selected_history=%d "
+            "global_history=%d tool_history=%d candidates=%d",
+            request.request_id,
+            request.job_id,
+            request.this_func_call,
+            result.ttl_seconds,
+            result.history_source,
+            result.expected_score,
+            result.finish_probability,
+            result.average_queue_delay,
+            result.memoryfulness,
+            result.prefill_reload_cost,
+            result.selected_history_size,
+            result.global_history_size,
+            result.tool_history_size,
+            result.candidate_count,
+        )
+        if self.ttl_diagnostic_scales:
+            base_prefill_reload = (
+                self.base_prefill_reload_profile.estimate_seconds(
+                    request.num_prompt_tokens
+                )
+            )
+            for diagnostic_scale in self.ttl_diagnostic_scales:
+                diagnostic_result = (
+                    self.dynamic_ttl_estimator.estimate_ttl(
+                        request.this_func_call,
+                        context_tokens=request.num_prompt_tokens,
+                        queue_delay_seconds=result.average_queue_delay,
+                        memoryfulness=result.memoryfulness,
+                        prefill_reload_cost_seconds=(
+                            base_prefill_reload * diagnostic_scale
+                        ),
+                    )
+                )
+                logger.info(
+                    "Continuum TTL counterfactual request=%s job=%s "
+                    "tool=%s actual_scale=%.6f diagnostic_scale=%.6f "
+                    "actual_ttl=%.6f cf_ttl=%.6f source=%s "
+                    "score=%.6f probability=%.6f queue_delay=%.6f "
+                    "memoryfulness=%.6f prefill_reload=%.6f "
+                    "selected_history=%d global_history=%d "
+                    "tool_history=%d candidates=%d",
+                    request.request_id,
+                    request.job_id,
+                    request.this_func_call,
+                    self.prefill_profile_scale,
+                    diagnostic_scale,
+                    result.ttl_seconds,
+                    diagnostic_result.ttl_seconds,
+                    diagnostic_result.history_source,
+                    diagnostic_result.expected_score,
+                    diagnostic_result.finish_probability,
+                    diagnostic_result.average_queue_delay,
+                    diagnostic_result.memoryfulness,
+                    diagnostic_result.prefill_reload_cost,
+                    diagnostic_result.selected_history_size,
+                    diagnostic_result.global_history_size,
+                    diagnostic_result.tool_history_size,
+                    diagnostic_result.candidate_count,
+                )
+
+        return result.ttl_seconds
+    def record_queue_transition(
+        self,
+        request: Request,
+        *,
+        prompt_length: int,
+        hit_length: int,
+        resumed_from_preemption: bool = False,
+    ) -> None:
+        if resumed_from_preemption:
+            return
+        if request.last_func_call is None:
+            return
+        if hit_length >= prompt_length:
+            return
+
+        queue_delay = max(0.0, time.time() - request.arrival_time)
+        self.dynamic_ttl_estimator.record_queue_delay(queue_delay)
 
     def request_arrives(self, request: Request) -> None:
         logger.info(f"Request job id arriving: {request.job_id}, time is {time.time()}")
+        self.job_request_counts[request.job_id] = (
+            self.job_request_counts.get(request.job_id, 0) + 1
+        )
         # this is called when a job arrives in scheduler.py, if job is new, create an entry,
         if request.job_id not in self.job_to_history:
             self.job_to_history[request.job_id] = []
-            assert request.last_func_call is None
-            self.job_to_history[request.job_id].append({"arrival_time": request.arrival_time})
+            if request.last_func_call is not None:
+                logger.warning(
+                    "Continuum recovered unseen follow-up job=%s "
+                    "last_func_call=%s; prior tool duration is unavailable "
+                    "and will be skipped",
+                    request.job_id,
+                    request.last_func_call,
+                )
+            self.job_to_history[request.job_id].append(
+                {"arrival_time": request.arrival_time}
+            )
             return
         request.last_func_call = self.job_to_history[request.job_id][-1]["func_call"]
         logger.info(f"Request job id: {request.job_id}, last func call: {request.last_func_call}")
@@ -177,9 +356,13 @@ class ToolCallEstimator:
     def request_finished(self, request: Request) -> None:
         logger.info(f"Request job id finishing: {request.job_id}, time is {time.time()}")
 
-        # Detokenize output and parse function call
-        this_func_call = None
-        if self.tokenizer is not None and len(request.output_token_ids) > 0:
+        # Prefer API metadata; retain generated-output parsing as fallback.
+        this_func_call = request.this_func_call
+        if (
+            this_func_call is None
+            and self.tokenizer is not None
+            and len(request.output_token_ids) > 0
+        ):
             try:
                 # Detokenize the output tokens
                 output_text = self.tokenizer.decode(
@@ -202,5 +385,9 @@ class ToolCallEstimator:
             "departure_time": time.time(),
             "func_call": request.this_func_call
         })
+        if bool(request.is_last_step):
+            self.dynamic_ttl_estimator.record_completed_program(
+                self.job_request_counts.get(request.job_id, 1)
+            )
         return
 

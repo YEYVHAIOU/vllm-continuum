@@ -248,6 +248,86 @@ class PrometheusStatLogger(StatLoggerBase):
         self.gauge_kv_cache_usage = make_per_engine(gauge_kv_cache_usage,
                                                     engine_indexes, model_name)
 
+
+        # CONTINUUM_KV_METRICS_V1
+        gauge_continuum_pinned_requests = self._gauge_cls(
+            name="vllm:continuum_pinned_requests",
+            documentation="Current number of pinned Continuum requests.",
+            labelnames=labelnames)
+        self.gauge_continuum_pinned_requests = make_per_engine(
+            gauge_continuum_pinned_requests, engine_indexes, model_name)
+        gauge_continuum_pinned_blocks = self._gauge_cls(
+            name="vllm:continuum_pinned_blocks",
+            documentation="Unique KV blocks referenced by pinned requests.",
+            labelnames=labelnames)
+        self.gauge_continuum_pinned_blocks = make_per_engine(
+            gauge_continuum_pinned_blocks, engine_indexes, model_name)
+        gauge_continuum_running_blocks = self._gauge_cls(
+            name="vllm:continuum_running_blocks",
+            documentation="Unique KV blocks referenced by running requests.",
+            labelnames=labelnames)
+        self.gauge_continuum_running_blocks = make_per_engine(
+            gauge_continuum_running_blocks, engine_indexes, model_name)
+        gauge_continuum_shared_pinned_running_blocks = self._gauge_cls(
+            name="vllm:continuum_shared_pinned_running_blocks",
+            documentation="KV blocks shared by pinned and running requests.",
+            labelnames=labelnames)
+        self.gauge_continuum_shared_pinned_running_blocks = make_per_engine(
+            gauge_continuum_shared_pinned_running_blocks, engine_indexes, model_name)
+        gauge_continuum_active_blocks = self._gauge_cls(
+            name="vllm:continuum_active_blocks",
+            documentation="KV blocks with a positive reference count.",
+            labelnames=labelnames)
+        self.gauge_continuum_active_blocks = make_per_engine(
+            gauge_continuum_active_blocks, engine_indexes, model_name)
+        gauge_continuum_active_unpinned_blocks = self._gauge_cls(
+            name="vllm:continuum_active_unpinned_blocks",
+            documentation="Active KV blocks not protected by pinned requests.",
+            labelnames=labelnames)
+        self.gauge_continuum_active_unpinned_blocks = make_per_engine(
+            gauge_continuum_active_unpinned_blocks, engine_indexes, model_name)
+        gauge_continuum_free_blocks = self._gauge_cls(
+            name="vllm:continuum_free_blocks",
+            documentation="Blocks in the free or eviction-candidate queue.",
+            labelnames=labelnames)
+        self.gauge_continuum_free_blocks = make_per_engine(
+            gauge_continuum_free_blocks, engine_indexes, model_name)
+        gauge_continuum_true_free_blocks = self._gauge_cls(
+            name="vllm:continuum_true_free_blocks",
+            documentation="Free blocks without cached prefix contents.",
+            labelnames=labelnames)
+        self.gauge_continuum_true_free_blocks = make_per_engine(
+            gauge_continuum_true_free_blocks, engine_indexes, model_name)
+        gauge_continuum_evictable_cached_blocks = self._gauge_cls(
+            name="vllm:continuum_evictable_cached_blocks",
+            documentation="Cached blocks available for eviction.",
+            labelnames=labelnames)
+        self.gauge_continuum_evictable_cached_blocks = make_per_engine(
+            gauge_continuum_evictable_cached_blocks, engine_indexes, model_name)
+        gauge_continuum_total_blocks = self._gauge_cls(
+            name="vllm:continuum_total_blocks",
+            documentation="Usable KV blocks excluding the null block.",
+            labelnames=labelnames)
+        self.gauge_continuum_total_blocks = make_per_engine(
+            gauge_continuum_total_blocks, engine_indexes, model_name)
+        gauge_continuum_pin_events_total = self._gauge_cls(
+            name="vllm:continuum_pin_events_total",
+            documentation="Cumulative Continuum pin events.",
+            labelnames=labelnames)
+        self.gauge_continuum_pin_events_total = make_per_engine(
+            gauge_continuum_pin_events_total, engine_indexes, model_name)
+        gauge_continuum_unpin_events_total = self._gauge_cls(
+            name="vllm:continuum_unpin_events_total",
+            documentation="Cumulative Continuum unpin events.",
+            labelnames=labelnames)
+        self.gauge_continuum_unpin_events_total = make_per_engine(
+            gauge_continuum_unpin_events_total, engine_indexes, model_name)
+        gauge_continuum_evicted_blocks_total = self._gauge_cls(
+            name="vllm:continuum_evicted_blocks_total",
+            documentation="Cumulative cached blocks evicted for reuse.",
+            labelnames=labelnames)
+        self.gauge_continuum_evicted_blocks_total = make_per_engine(
+            gauge_continuum_evicted_blocks_total, engine_indexes, model_name)
         counter_prefix_cache_queries = self._counter_cls(
             name="vllm:prefix_cache_queries",
             documentation=(
@@ -518,6 +598,34 @@ class PrometheusStatLogger(StatLoggerBase):
             self.gauge_kv_cache_usage[engine_idx].set(
                 scheduler_stats.kv_cache_usage)
 
+
+            # CONTINUUM_KV_METRICS_V1
+            self.gauge_continuum_pinned_requests[engine_idx].set(
+                scheduler_stats.continuum_pinned_requests)
+            self.gauge_continuum_pinned_blocks[engine_idx].set(
+                scheduler_stats.continuum_pinned_blocks)
+            self.gauge_continuum_running_blocks[engine_idx].set(
+                scheduler_stats.continuum_running_blocks)
+            self.gauge_continuum_shared_pinned_running_blocks[engine_idx].set(
+                scheduler_stats.continuum_shared_pinned_running_blocks)
+            self.gauge_continuum_active_blocks[engine_idx].set(
+                scheduler_stats.continuum_active_blocks)
+            self.gauge_continuum_active_unpinned_blocks[engine_idx].set(
+                scheduler_stats.continuum_active_unpinned_blocks)
+            self.gauge_continuum_free_blocks[engine_idx].set(
+                scheduler_stats.continuum_free_blocks)
+            self.gauge_continuum_true_free_blocks[engine_idx].set(
+                scheduler_stats.continuum_true_free_blocks)
+            self.gauge_continuum_evictable_cached_blocks[engine_idx].set(
+                scheduler_stats.continuum_evictable_cached_blocks)
+            self.gauge_continuum_total_blocks[engine_idx].set(
+                scheduler_stats.continuum_total_blocks)
+            self.gauge_continuum_pin_events_total[engine_idx].set(
+                scheduler_stats.continuum_pin_events_total)
+            self.gauge_continuum_unpin_events_total[engine_idx].set(
+                scheduler_stats.continuum_unpin_events_total)
+            self.gauge_continuum_evicted_blocks_total[engine_idx].set(
+                scheduler_stats.continuum_evicted_blocks_total)
             self.counter_gpu_prefix_cache_queries[engine_idx].inc(
                 scheduler_stats.prefix_cache_stats.queries)
             self.counter_gpu_prefix_cache_hits[engine_idx].inc(

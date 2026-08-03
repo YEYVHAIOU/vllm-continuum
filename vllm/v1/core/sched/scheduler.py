@@ -137,6 +137,11 @@ class Scheduler(SchedulerInterface):
 
         # TODO(Hanchen) This stored the list of pineed requests and the time they need to be removed
         self.pinned_requests: list[Tuple[Request, float]] = []
+        # CONTINUUM_KV_METRICS_V1
+        self.continuum_pin_events_total = 0
+        self.continuum_unpin_events_total = 0
+        self._continuum_pinned_request_blocks: dict[str, set[int]] = {}
+        self._continuum_pinned_block_refcounts: dict[int, int] = {}
         # Track the first entry time for each job_id in running queue (for job_id level FCFS)
         self.running_job_id_first_entry_time: dict[str] = {}
         # Track prefill start time for throughput measurement
@@ -204,6 +209,7 @@ class Scheduler(SchedulerInterface):
                     latest_pin_end_request = req
             if latest_pin_end_request is not None:
                 self.pinned_requests.remove((latest_pin_end_request, latest_pin_end_time))
+                self._continuum_track_unpin(latest_pin_end_request)
                 return latest_pin_end_request, True
 
             raise IndexError("pop from empty running queue")
@@ -233,13 +239,70 @@ class Scheduler(SchedulerInterface):
             self.running.remove(latest_request)
             return latest_request, False
     
+
+    def _continuum_get_request_block_ids(
+        self,
+        request: Request,
+    ) -> set[int]:
+        try:
+            grouped_ids = self.kv_cache_manager.get_block_ids(
+                request.request_id)
+        except Exception:
+            return set()
+        null_id = self.kv_cache_manager.block_pool.null_block.block_id
+        return {
+            block_id
+            for group_ids in grouped_ids
+            for block_id in group_ids
+            if block_id != null_id
+        }
+
+    def _continuum_track_pin(self, request: Request) -> None:
+        block_ids = self._continuum_get_request_block_ids(request)
+        previous = self._continuum_pinned_request_blocks.pop(
+            request.request_id, set())
+        for block_id in previous:
+            count = self._continuum_pinned_block_refcounts.get(block_id, 0)
+            if count <= 1:
+                self._continuum_pinned_block_refcounts.pop(block_id, None)
+            else:
+                self._continuum_pinned_block_refcounts[block_id] = count - 1
+
+        self._continuum_pinned_request_blocks[
+            request.request_id] = block_ids
+        for block_id in block_ids:
+            self._continuum_pinned_block_refcounts[block_id] = (
+                self._continuum_pinned_block_refcounts.get(block_id, 0) + 1
+            )
+        self.continuum_pin_events_total += 1
+
+    def _continuum_track_unpin(self, request: Request) -> None:
+        block_ids = self._continuum_pinned_request_blocks.pop(
+            request.request_id, set())
+        for block_id in block_ids:
+            count = self._continuum_pinned_block_refcounts.get(block_id, 0)
+            if count <= 1:
+                self._continuum_pinned_block_refcounts.pop(block_id, None)
+            else:
+                self._continuum_pinned_block_refcounts[block_id] = count - 1
+        self.continuum_unpin_events_total += 1
+
+    def _continuum_get_running_block_ids(self) -> set[int]:
+        block_ids: set[int] = set()
+        for request in self.running:
+            block_ids.update(
+                self._continuum_get_request_block_ids(request))
+        return block_ids
+
     # TODO (Hanchen) needs to get current time, add with length of pin to put end time of pin
     def pin_request(self, request: Request, length_of_pin: float) -> None:
         self.continuum_recorder.request_pinned(request)
+        self._continuum_track_pin(request)
         self.pinned_requests.append((request, time.time() + length_of_pin))
 
     def unpin_request(self, request: Request, end_time: float) -> None:
         self.pinned_requests.remove((request, end_time))
+        self._continuum_track_unpin(request)
         self.continuum_recorder.request_unpinned(request)
         self.kv_cache_manager.free(request)
 
@@ -673,12 +736,27 @@ class Scheduler(SchedulerInterface):
                         prompt_length=request.num_prompt_tokens,
                         hit_length=num_computed_tokens
                     )
+                    self.tool_call_estimator.record_queue_transition(
+                        request,
+                        prompt_length=request.num_prompt_tokens,
+                        hit_length=num_computed_tokens,
+                        resumed_from_preemption=False,
+                    )
                     scheduled_new_reqs.append(request)
                 elif request.status == RequestStatus.PREEMPTED:
                     self.continuum_recorder.request_evicted_to_running(
                         request,
                         prompt_length=request.num_prompt_tokens,
                         hit_length=num_computed_tokens
+                    )
+                    self.tool_call_estimator.record_queue_transition(
+                        request,
+                        prompt_length=request.num_prompt_tokens,
+                        hit_length=min(
+                            num_computed_tokens,
+                            request.num_prompt_tokens,
+                        ),
+                        resumed_from_preemption=True,
                     )
                     scheduled_resumed_reqs.append(request)
                 else:
@@ -1386,10 +1464,44 @@ class Scheduler(SchedulerInterface):
             return None
         prefix_cache_stats = self.kv_cache_manager.make_prefix_cache_stats()
         assert prefix_cache_stats is not None
+
+        block_pool = self.kv_cache_manager.block_pool
+        total_blocks = block_pool.num_gpu_blocks - 1
+        free_blocks = block_pool.get_num_free_blocks()
+        evictable_cached_blocks = (
+            block_pool.continuum_evictable_cached_blocks)
+        true_free_blocks = max(
+            0, free_blocks - evictable_cached_blocks)
+        active_blocks = max(0, total_blocks - free_blocks)
+        pinned_block_ids = set(
+            self._continuum_pinned_block_refcounts)
+        running_block_ids = self._continuum_get_running_block_ids()
+        shared_pinned_running_blocks = len(
+            pinned_block_ids & running_block_ids)
+
         return SchedulerStats(
             num_running_reqs=len(self.running),
             num_waiting_reqs=len(self.waiting),
             kv_cache_usage=self.kv_cache_manager.usage,
+            continuum_pinned_requests=len(self.pinned_requests),
+            continuum_pinned_blocks=len(pinned_block_ids),
+            continuum_running_blocks=len(running_block_ids),
+            continuum_shared_pinned_running_blocks=(
+                shared_pinned_running_blocks),
+            continuum_active_blocks=active_blocks,
+            continuum_active_unpinned_blocks=max(
+                0, active_blocks - len(pinned_block_ids)),
+            continuum_free_blocks=free_blocks,
+            continuum_true_free_blocks=true_free_blocks,
+            continuum_evictable_cached_blocks=(
+                evictable_cached_blocks),
+            continuum_total_blocks=total_blocks,
+            continuum_pin_events_total=(
+                self.continuum_pin_events_total),
+            continuum_unpin_events_total=(
+                self.continuum_unpin_events_total),
+            continuum_evicted_blocks_total=(
+                block_pool.continuum_evicted_blocks_total),
             prefix_cache_stats=prefix_cache_stats,
             spec_decoding_stats=spec_decoding_stats,
             num_corrupted_reqs=sum(req.is_output_corrupted

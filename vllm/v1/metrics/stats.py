@@ -39,6 +39,21 @@ class SchedulerStats:
 
     kv_cache_usage: float = 0.0
 
+    # CONTINUUM_KV_METRICS_V1
+    continuum_pinned_requests: int = 0
+    continuum_pinned_blocks: int = 0
+    continuum_running_blocks: int = 0
+    continuum_shared_pinned_running_blocks: int = 0
+    continuum_active_blocks: int = 0
+    continuum_active_unpinned_blocks: int = 0
+    continuum_free_blocks: int = 0
+    continuum_true_free_blocks: int = 0
+    continuum_evictable_cached_blocks: int = 0
+    continuum_total_blocks: int = 0
+    continuum_pin_events_total: int = 0
+    continuum_unpin_events_total: int = 0
+    continuum_evicted_blocks_total: int = 0
+
     prefix_cache_stats: PrefixCacheStats = field(
         default_factory=PrefixCacheStats)
 

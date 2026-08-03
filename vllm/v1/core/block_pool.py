@@ -72,6 +72,10 @@ class BlockPool:
         self.enable_kv_cache_events = enable_kv_cache_events
         self.kv_event_queue: list[KVCacheEvent] = []
 
+        # CONTINUUM_KV_METRICS_V1
+        self.continuum_evictable_cached_blocks = 0
+        self.continuum_evicted_blocks_total = 0
+
     def get_cached_block(
             self, block_hash: BlockHash,
             kv_cache_group_ids: list[int]) -> Optional[list[KVCacheBlock]]:
@@ -231,6 +235,9 @@ class BlockPool:
                     maybe_convert_block_hash(get_block_hash(block_hash))
                 ],
                              medium=MEDIUM_GPU))
+        self.continuum_evictable_cached_blocks = max(
+            0, self.continuum_evictable_cached_blocks - 1)
+        self.continuum_evicted_blocks_total += 1
         return True
 
     def touch(self, blocks: tuple[list[KVCacheBlock], ...]) -> None:
@@ -247,6 +254,11 @@ class BlockPool:
                 # candidate), so remove it.
                 if block.ref_cnt == 0 and not block.is_null:
                     self.free_block_queue.remove(block)
+                    if block.block_hash is not None:
+                        self.continuum_evictable_cached_blocks = max(
+                            0,
+                            self.continuum_evictable_cached_blocks - 1,
+                        )
                 block.ref_cnt += 1
 
     def free_blocks(self, ordered_blocks: Iterable[KVCacheBlock]) -> None:
@@ -261,10 +273,15 @@ class BlockPool:
         blocks_list = list(ordered_blocks)
         for block in blocks_list:
             block.ref_cnt -= 1
-        self.free_block_queue.append_n([
+        newly_free_blocks = [
             block for block in blocks_list
             if block.ref_cnt == 0 and not block.is_null
-        ])
+        ]
+        self.free_block_queue.append_n(newly_free_blocks)
+        self.continuum_evictable_cached_blocks += sum(
+            block.block_hash is not None
+            for block in newly_free_blocks
+        )
 
     def reset_prefix_cache(self) -> bool:
         """Reset prefix cache. This function may be used in RLHF
@@ -284,6 +301,7 @@ class BlockPool:
 
         # Remove all hashes so that no new blocks will hit.
         self.cached_block_hash_to_block = defaultdict(dict)
+        self.continuum_evictable_cached_blocks = 0
 
         # Remove all hashes from all blocks.
         for block in self.blocks:
