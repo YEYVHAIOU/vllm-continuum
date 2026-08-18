@@ -2,6 +2,7 @@ from vllm.v1.request import Request
 from vllm.v1.core.dynamic_ttl_estimator import (
     DynamicTTLEstimator,
     PiecewiseLinearPrefillReloadProfile,
+    TTLEstimatorConfig,
 )
 from typing import Optional
 import time
@@ -136,7 +137,99 @@ class ToolCallEstimator:
                 "CONTINUUM_PREFILL_PROFILE_SCALE must be finite and > 0, "
                 f"got {profile_scale!r}"
             )
+        # CONTINUUM_HISTORY_THRESHOLD_V1
+
+        raw_history_threshold = os.environ.get(
+
+            "CONTINUUM_HISTORY_THRESHOLD", "100"
+
+        )
+
+        try:
+
+            history_threshold = int(raw_history_threshold)
+
+        except ValueError as exc:
+
+            raise ValueError(
+
+                "CONTINUUM_HISTORY_THRESHOLD must be an integer >= 1, "
+
+                f"got {raw_history_threshold!r}"
+
+            ) from exc
+
+        if history_threshold < 1:
+
+            raise ValueError(
+
+                "CONTINUUM_HISTORY_THRESHOLD must be >= 1, "
+
+                f"got {history_threshold!r}"
+
+            )
+
+        logger.info(
+
+            "Continuum history threshold=%d",
+
+            history_threshold,
+
+        )
+
+
+
+        # CONTINUUM_DEFAULT_TTL_ENV_V1
+
+        raw_default_ttl = os.environ.get(
+
+            "CONTINUUM_DEFAULT_TTL_SECONDS", "2.0"
+
+        )
+
+        try:
+
+            default_ttl_seconds = float(raw_default_ttl)
+
+        except ValueError as exc:
+
+            raise ValueError(
+
+                "CONTINUUM_DEFAULT_TTL_SECONDS must be a nonnegative number, "
+
+                f"got {raw_default_ttl!r}"
+
+            ) from exc
+
+        if (
+
+            not math.isfinite(default_ttl_seconds)
+
+            or default_ttl_seconds < 0.0
+
+        ):
+
+            raise ValueError(
+
+                "CONTINUUM_DEFAULT_TTL_SECONDS must be finite and >= 0, "
+
+                f"got {default_ttl_seconds!r}"
+
+            )
+
+        logger.info(
+
+            "Continuum default TTL=%.6f",
+
+            default_ttl_seconds,
+
+        )
+
+
+
         scaled_prefill_profile_points = tuple(
+
+
             (tokens, seconds * profile_scale)
             for tokens, seconds in base_prefill_profile_points
         )
@@ -180,6 +273,15 @@ class ToolCallEstimator:
             scaled_prefill_profile_points,
         )
         self.dynamic_ttl_estimator = DynamicTTLEstimator(
+
+            config=TTLEstimatorConfig(
+
+                history_threshold=history_threshold,
+
+
+                default_ttl_seconds=default_ttl_seconds,
+            ),
+
             prefill_reload_profile=PiecewiseLinearPrefillReloadProfile(
                 points=scaled_prefill_profile_points
             )
