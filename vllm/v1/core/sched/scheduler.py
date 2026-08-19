@@ -877,6 +877,7 @@ class Scheduler(SchedulerInterface):
                         continue
 
                     continuum_hints[request_id] = {
+                        "context_tokens": request.num_prompt_tokens,
                         "ttl_seconds": ttl_result.ttl_seconds,
                         "history_source": ttl_result.history_source,
                         "finish_probability": (
