@@ -857,9 +857,40 @@ class Scheduler(SchedulerInterface):
             set_runtime_context = getattr(
                 self.connector, "set_runtime_context", None
             )
+            continuum_hints = {}
+            if self.policy == SchedulingPolicy.CONTINUUM:
+                for request_id in scheduler_output.num_scheduled_tokens:
+                    request = self.requests.get(request_id)
+                    if request is None:
+                        continue
+                    if request.is_last_step:
+                        continue
+                    if request.this_func_call is None:
+                        continue
+
+                    ttl_result = (
+                        self.tool_call_estimator.get_or_estimate_ttl(
+                            request
+                        )
+                    )
+                    if ttl_result is None:
+                        continue
+
+                    continuum_hints[request_id] = {
+                        "ttl_seconds": ttl_result.ttl_seconds,
+                        "history_source": ttl_result.history_source,
+                        "finish_probability": (
+                            ttl_result.finish_probability
+                        ),
+                        "expected_score": ttl_result.expected_score,
+                        "prefill_reload_cost": (
+                            ttl_result.prefill_reload_cost
+                        ),
+                    }
             if callable(set_runtime_context):
                 set_runtime_context(
                     kv_pressure=self.kv_cache_manager.usage,
+                    continuum_hints=continuum_hints,
                 )
             meta = self.connector.build_connector_meta(scheduler_output)
             scheduler_output.kv_connector_metadata = meta

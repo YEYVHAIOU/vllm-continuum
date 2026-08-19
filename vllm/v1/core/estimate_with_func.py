@@ -334,14 +334,50 @@ class ToolCallEstimator:
         self.dynamic_ttl_estimator.record_tool_duration(func, exec_time)
 
     #Functions below will be called by outside functions
+    def get_or_estimate_ttl(self, request: Request):
+        """Return one stable TTL prediction for this request."""
+        if request.this_func_call is None:
+            return None
+
+        cache = getattr(self, "_ttl_result_cache", None)
+        if cache is None:
+            cache = {}
+            self._ttl_result_cache = cache
+
+        result = cache.get(request.request_id)
+        if result is None:
+            result = self.dynamic_ttl_estimator.estimate_ttl(
+                request.this_func_call,
+                context_tokens=request.num_prompt_tokens,
+            )
+            cache[request.request_id] = result
+            logger.info(
+                "Continuum TTL precomputed request=%s job=%s tool=%s "
+                "ttl=%.6f source=%s probability=%.6f score=%.6f "
+                "prefill_reload=%.6f",
+                request.request_id,
+                request.job_id,
+                request.this_func_call,
+                result.ttl_seconds,
+                result.history_source,
+                result.finish_probability,
+                result.expected_score,
+                result.prefill_reload_cost,
+            )
+        return result
+
+    def clear_cached_ttl_result(self, request_id: str) -> None:
+        cache = getattr(self, "_ttl_result_cache", None)
+        if cache is not None:
+            cache.pop(request_id, None)
+
     def set_up_pin(self, request: Request) -> float:
         if request.this_func_call is None:
             return 0.0
 
-        result = self.dynamic_ttl_estimator.estimate_ttl(
-            request.this_func_call,
-            context_tokens=request.num_prompt_tokens,
-        )
+        result = self.get_or_estimate_ttl(request)
+        if result is None:
+            return 0.0
         logger.info(
             "Continuum dynamic TTL request=%s job=%s tool=%s "
             "ttl=%.6f source=%s score=%.6f probability=%.6f "
@@ -408,7 +444,9 @@ class ToolCallEstimator:
                     diagnostic_result.candidate_count,
                 )
 
-        return result.ttl_seconds
+        ttl_seconds = result.ttl_seconds
+        self.clear_cached_ttl_result(request.request_id)
+        return ttl_seconds
     def record_queue_transition(
         self,
         request: Request,
@@ -491,5 +529,6 @@ class ToolCallEstimator:
             self.dynamic_ttl_estimator.record_completed_program(
                 self.job_request_counts.get(request.job_id, 1)
             )
+            self.clear_cached_ttl_result(request.request_id)
         return
 
