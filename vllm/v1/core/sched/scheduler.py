@@ -864,6 +864,9 @@ class Scheduler(SchedulerInterface):
                     if request is None:
                         continue
                     if request.is_last_step:
+                        continuum_hints[request_id] = {
+                            "is_terminal": True,
+                        }
                         continue
                     if request.this_func_call is None:
                         continue
