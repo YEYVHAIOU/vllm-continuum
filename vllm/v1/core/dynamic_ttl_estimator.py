@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 import random
 import statistics
 from collections import defaultdict, deque
@@ -245,6 +246,14 @@ class DynamicTTLEstimator:
         self.prefill_reload_profile = (
             prefill_reload_profile or ConstantPrefillReloadProfile(0.0)
         )
+        self.cdf_implementation = os.environ.get(
+            "CONTINUUM_TTL_CDF_IMPL", "optimized"
+        ).strip().lower()
+        if self.cdf_implementation not in {"naive", "optimized"}:
+            raise ValueError(
+                "CONTINUUM_TTL_CDF_IMPL must be naive or optimized, got "
+                f"{self.cdf_implementation!r}"
+            )
 
         self._tool_histories: dict[str, Deque[float]] = defaultdict(
             lambda: deque(maxlen=self.config.max_tool_history)
@@ -424,21 +433,33 @@ class DynamicTTLEstimator:
         best_score = 0.0
         best_probability = self.empirical_finish_probability(history, 0.0)
 
-        for ttl in candidates:
-            probability = self.empirical_finish_probability(history, ttl)
-            score = probability * benefit_if_hit - ttl
+        # CONTINUUM_TTL_CDF_OPT_V1
+        if self.cdf_implementation == "optimized":
+            # Mathematically equivalent empirical-CDF search with one sorted
+            # history scan: O(n log n) instead of O(n^2).
+            sorted_history = sorted(float(duration) for duration in history)
+            history_size = len(sorted_history)
+            history_index = 0
 
-            # Prefer the smaller TTL when scores are numerically tied.
-            if (
-                score > best_score + 1e-12
-                or (
-                    abs(score - best_score) <= 1e-12
-                    and ttl < best_ttl
-                )
-            ):
-                best_ttl = ttl
-                best_score = score
-                best_probability = probability
+            for ttl in candidates:
+                while history_index < history_size and sorted_history[history_index] <= ttl:
+                    history_index += 1
+                probability = history_index / history_size
+                score = probability * benefit_if_hit - ttl
+                if score > best_score + 1e-12 or (abs(score - best_score) <= 1e-12 and ttl < best_ttl):
+                    best_ttl = ttl
+                    best_score = score
+                    best_probability = probability
+        else:
+            # Historical paper-aligned implementation retained for controlled
+            # ablation and reproducibility.
+            for ttl in candidates:
+                probability = self.empirical_finish_probability(history, ttl)
+                score = probability * benefit_if_hit - ttl
+                if score > best_score + 1e-12 or (abs(score - best_score) <= 1e-12 and ttl < best_ttl):
+                    best_ttl = ttl
+                    best_score = score
+                    best_probability = probability
 
         return TTLEstimationResult(
             ttl_seconds=best_ttl,

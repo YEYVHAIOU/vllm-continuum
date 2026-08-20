@@ -436,6 +436,9 @@ def wait_for_kv_layer_from_connector(layer_name: str):
         return
 
     connector = get_kv_transfer_group()
+    active_load = getattr(connector, "has_active_load", None)
+    if callable(active_load) and not active_load():
+        return
 
     forward_context: ForwardContext = get_forward_context()
     attn_metadata = forward_context.attn_metadata
@@ -453,6 +456,9 @@ def maybe_save_kv_layer_to_connector(
         return
 
     connector = get_kv_transfer_group()
+    active_save = getattr(connector, "has_active_save", None)
+    if callable(active_save) and not active_save():
+        return
 
     forward_context: ForwardContext = get_forward_context()
     attn_metadata = forward_context.attn_metadata

@@ -41,7 +41,9 @@ class KVConnectorModelRunnerMixin:
             # These transfers are designed to be async and the requests
             # involved may be disjoint from the running requests.
             # Do this here to save a collective_rpc.
-            kv_connector.start_load_kv(get_forward_context())
+            active_load = getattr(kv_connector, "has_active_load", None)
+            if not callable(active_load) or active_load():
+                kv_connector.start_load_kv(get_forward_context())
 
     @staticmethod
     def ensure_kv_transfer_shutdown() -> None:
@@ -109,11 +111,14 @@ class KVConnectorModelRunnerMixin:
         # These transfers are designed to be async and the requests
         # involved may be disjoint from the running requests.
         # Do this here to save a collective_rpc.
-        kv_connector.start_load_kv(get_forward_context())
+        active_load = getattr(kv_connector, "has_active_load", None)
+        if not callable(active_load) or active_load():
+            kv_connector.start_load_kv(get_forward_context())
         try:
             yield output
         finally:
-            if wait_for_save:
+            active_save = getattr(kv_connector, "has_active_save", None)
+            if wait_for_save and (not callable(active_save) or active_save()):
                 kv_connector.wait_for_save()
 
             output.finished_sending, output.finished_recving = (

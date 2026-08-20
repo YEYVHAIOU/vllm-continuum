@@ -286,6 +286,12 @@ class ToolCallEstimator:
                 points=scaled_prefill_profile_points
             )
         )
+        # CONTINUUM_TTL_TIMING_V1
+        self._ttl_estimate_calls = 0
+        self._ttl_estimate_total_ns = 0
+        self._ttl_estimate_max_ns = 0
+        self._ttl_timing_interval = max(0, int(os.environ.get("CONTINUUM_TTL_TIMING_INTERVAL", "0")))
+
         # Initialize tokenizer
         if tokenizer is not None:
             self.tokenizer = tokenizer
@@ -346,10 +352,34 @@ class ToolCallEstimator:
 
         result = cache.get(request.request_id)
         if result is None:
-            result = self.dynamic_ttl_estimator.estimate_ttl(
-                request.this_func_call,
-                context_tokens=request.num_prompt_tokens,
-            )
+            if self._ttl_timing_interval > 0:
+                _ttl_t0 = time.perf_counter_ns()
+                result = self.dynamic_ttl_estimator.estimate_ttl(
+                    request.this_func_call,
+                    context_tokens=request.num_prompt_tokens,
+                )
+                _ttl_elapsed_ns = time.perf_counter_ns() - _ttl_t0
+                self._ttl_estimate_calls += 1
+                self._ttl_estimate_total_ns += _ttl_elapsed_ns
+                self._ttl_estimate_max_ns = max(
+                    self._ttl_estimate_max_ns, _ttl_elapsed_ns
+                )
+                if self._ttl_estimate_calls % self._ttl_timing_interval == 0:
+                    logger.info(
+                        "Continuum TTL timing calls=%d total_ms=%.3f mean_ms=%.6f max_ms=%.6f last_ms=%.6f selected_history=%d candidates=%d",
+                        self._ttl_estimate_calls,
+                        self._ttl_estimate_total_ns / 1e6,
+                        self._ttl_estimate_total_ns / self._ttl_estimate_calls / 1e6,
+                        self._ttl_estimate_max_ns / 1e6,
+                        _ttl_elapsed_ns / 1e6,
+                        result.selected_history_size,
+                        result.candidate_count,
+                    )
+            else:
+                result = self.dynamic_ttl_estimator.estimate_ttl(
+                    request.this_func_call,
+                    context_tokens=request.num_prompt_tokens,
+                )
             cache[request.request_id] = result
             logger.info(
                 "Continuum TTL precomputed request=%s job=%s tool=%s "
