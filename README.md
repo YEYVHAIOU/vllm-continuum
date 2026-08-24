@@ -1,170 +1,143 @@
-# vLLM with Continuum Scheduling
+# vLLM + Continuum 研究分支
 
-This repository contains a modified version of vLLM with Continuum-style scheduling support (without the estimation in the paper) for improved inference performance. For multi-node support, you should use sticky-session routing. 
+本仓库保存本项目最终使用的 vLLM / Continuum 修改源码。它以 Continuum 调度代码为基础，进一步加入 Dynamic TTL、Prefill / Reload 成本建模、运行时 KV 压力与时序提示，以及与 UCM KVConnector 协作所需的生命周期和性能修正。
 
-You can use this as a base-repo to tune KV cache pin logic on different workloads.
+主项目、部署脚本和正式实验结果位于：
 
-## Table of Contents
+<https://github.com/YEYVHAIOU/vllm-prefix-experiment>
 
-- [Prerequisites](#prerequisites)
-- [Installation](#installation)
-- [Usage](#usage)
-  - [Starting the Server](#starting-the-server)
-  - [Original vLLM Mode](#original-vllm-mode)
-  - [Continuum Scheduling Mode](#continuum-scheduling-mode)
-- [Evaluation](#evaluation)
-  - [Running SWE-bench Evaluation](#running-swe-bench-evaluation)
-  - [Analyzing Results](#analyzing-results)
+> 本仓库是研究修改分支，不是 vLLM 或 Continuum 的官方发行版。
 
-## Prerequisites
+## 最终版本
 
-- Python 3.8+
-- [uv](https://github.com/astral-sh/uv) package manager
-- Hugging Face account with access token
-- GPU(s) with appropriate CUDA drivers
-
-## Installation
-
-```bash
-# Create and activate a virtual environment
-uv venv
-source .venv/bin/activate
-
-# Install the package in editable mode
-uv pip install -e .
-
-# Install mini-swe-agent
-cd mini-swe-agent
-uv pip install -e .
-uv pip install datasets
-cd ..
-
-# Install additional dependencies
-uv pip install lmcache hf_transfer
-
-# Log in to Hugging Face (required for model access)
-hf auth login
-# Enter your Hugging Face access token when prompted
+```text
+branch = joint-offload-v1
+commit = 6e7d571b831e6e4b82f1b2f8228cc84e9a0261a2
+tag    = vllm-continuum-final-20260820
 ```
 
-**Additional Setup**: Follow the instructions to set up [sb-cli](https://www.swebench.com/sb-cli/), which is required for pass rate evaluation.
+正式 V/U/C/F 实验均以该源码树作为 vLLM 侧统一代码基座，通过调度策略和 UCM 开关构造不同配置。
 
-## Usage
+## 主要修改
 
-### Starting the Server
+### Dynamic TTL
 
-#### Original vLLM Mode
+Continuum 基础代码使用固定工具调用时间阈值控制 KV 驻留。本项目在此基础上加入动态 TTL 估计，使保留时间能够结合工具调用历史、上下文规模和 Prefill / Reload 成本变化。
 
-Run vLLM with standard scheduling:
+主要实现包括：
 
-```bash
-# Without CPU offload
-vllm serve <MODEL_NAME> \
-  --tensor-parallel-size <NUM_GPUS> \
-  --port <PORT_ID>
-
-# With CPU offload (requires lmcache)
-LMCACHE_MAX_LOCAL_CPU_SIZE=<CPU_SIZE_GB> \
-vllm serve <MODEL_NAME> \
-  --kv-transfer-config '{"kv_connector":"LMCacheConnectorV1","kv_role":"kv_both"}' \
-  --tensor-parallel-size <NUM_GPUS> \
-  --port <PORT_ID>
+```text
+vllm/v1/core/dynamic_ttl_estimator.py
+vllm/v1/core/estimate_with_func.py
 ```
 
-#### Continuum Scheduling Mode
+正式配置支持：
 
-Run vLLM with Continuum scheduling for optimized performance:
-
-```bash
-# Without CPU offload
-vllm serve <MODEL_NAME> \
-  --scheduling-policy continuum \
-  --tensor-parallel-size <NUM_GPUS> \
-  --port <PORT_ID>
-
-# With CPU offload (requires lmcache)
-LMCACHE_MAX_LOCAL_CPU_SIZE=<CPU_SIZE_GB> \
-vllm serve <MODEL_NAME> \
-  --kv-transfer-config '{"kv_connector":"LMCacheConnectorV1","kv_role":"kv_both"}' \
-  --scheduling-policy continuum \
-  --tensor-parallel-size <NUM_GPUS> \
-  --port <PORT_ID>
+```text
+CONTINUUM_TTL_CDF_IMPL
+CONTINUUM_HISTORY_THRESHOLD
+CONTINUUM_DEFAULT_TTL_SECONDS
+CONTINUUM_PREFILL_PROFILE_SCALE
+CONTINUUM_TTL_TIMING_INTERVAL
 ```
 
-**Example:**
-```bash
-# Run Llama-3.1-70B-Instruct with Continuum on 4 GPUs
-vllm serve meta-llama/Llama-3.1-70B-Instruct \
-  --scheduling-policy continuum \
-  --tensor-parallel-size 4
+经验 CDF 路径同时进行了性能优化，以减少调度热路径中的重复扫描开销。
+
+### 运行时 KV 上下文
+
+为了让 UCM 能够使用 Continuum 的时序信息，vLLM 侧向 KVConnector 传递运行时上下文，包括：
+
+```text
+kv_pressure
+continuum_hints
+context_tokens
+is_terminal
+finish_probability
+expected_tool_duration
+prefill_reload_cost
 ```
 
-## Evaluation
+这些信息用于联合判断未来复用价值、GPU KV 压力和外部迁移成本。
 
-### Running SWE-bench Evaluation
+### KVConnector 生命周期
 
-**Note:** The default evaluation setup uses `meta-llama/Llama-3.1-70B-Instruct` on 4 H100 GPUs. Mini-swe-agent may encounter issues with smaller or simpler models.
+项目针对当前 vLLM V1 与 UCM 的组合处理了 load/save 活跃状态、元数据生命周期、warmup 和空传输路径。
 
-1. **Start the vLLM server** (see [Usage](#usage) section above)
+当一次前向过程没有实际 KV load/save 时，vLLM 可以通过 active load/save 状态跳过不必要的 KVConnector 数据路径，从而降低额外同步和 Python 调用开销。
 
-2. **Run the SWE-bench evaluation:**
+### CUDA Graph
 
-```bash
-# Clear previous output before each run
-rm -rf ./swebench_output
+早期 UCM 集成曾使用 `--enforce-eager` 保证兼容。随着 KVConnector 生命周期和空传输路径完善，最终正式版本恢复非 eager 执行，允许正常 CUDA Graph 路径。
 
-# Run evaluation (fixed concurrency)
-mini-extra swebench \
-  --model-class vllm \
-  --model <MODEL_NAME> \
-  --port <PORT_ID> \
-  --subset verified \
-  --split test \
-  --workers 64 \
-  --output ./swebench_output
+## 与 UCM 的关系
 
-# Run evaluation (Poisson arrival rate)
-mini-extra swebench \
-  --model-class vllm \
-  --model <MODEL_NAME> \
-  --port <PORT_ID> \
-  --subset verified \
-  --split test \
-  --use-jps --jps 1.0 \
-  --output ./swebench_output
+UCM 修改源码位于独立仓库：
+
+<https://github.com/YEYVHAIOU/unified-cache-management-continuum>
+
+最终联合系统使用：
+
+```text
+Dynamic TTL
+    +
+cost_full WHEN
+    +
+Frontier-Tail WHAT (K=4)
+    +
+TieredStore WHERE
 ```
 
-#### Load Control Modes
+vLLM 侧负责调度、TTL、运行时上下文和 KVConnector 调用；UCM 侧负责外部 KV 的 WHEN / WHAT / WHERE 决策与存储实现。
 
-| Mode | Flag | Description |
-|------|------|-------------|
-| Workers | `--workers N` | Fixed N concurrent jobs |
-| JPS | `--use-jps --jps X` | Poisson process at X jobs/second |
+## 快速使用
 
-### Analyzing Results
+本仓库不单独提供完整实验入口。推荐按照主项目的三个同级仓库结构部署：
 
-**Important:** Terminate the vLLM server (Ctrl+C) before running the evaluation analysis.
-
-```bash
-# Analyze latency metrics
-python continuum_exp/analyze.py \
-  --output-dir <OUTPUT_DIRECTORY>
-
-# Submit pass rate evaluation (use a unique run_id for each evaluation)
-sb-cli submit swe-bench_verified test \
-  --predictions_path swebench_output/preds.json \
-  --run_id <UNIQUE_RUN_ID>
+```text
+workspace/
+├── vllm-prefix-experiment/
+├── vllm-continuum/
+└── unified-cache-management-continuum/
 ```
 
-## Configuration Parameters
+切换本仓库到最终标签：
 
-| Parameter | Description | Example |
-|-----------|-------------|---------|
-| `<MODEL_NAME>` | Hugging Face model identifier | `meta-llama/Llama-3.1-70B-Instruct` |
-| `<NUM_GPUS>` | Number of GPUs for tensor parallelism | `4` |
-| `<CPU_SIZE_GB>` | CPU memory size in GB for KV cache offload | `200` |
-| `<OUTPUT_DIRECTORY>` | Directory for analysis output | `./continuum_exp/result` |
-| `<UNIQUE_RUN_ID>` | Identifier for evaluation run | `continuum_run_001` |
-| `--workers` | Fixed number of concurrent jobs | `64` |
-| `--use-jps` | Enable Poisson arrival mode | - |
-| `--jps` | Jobs per second (with `--use-jps`) | `1.0` |
+```bash
+git checkout vllm-continuum-final-20260820
+```
+
+随后按照主项目的 [`docs/DEPLOYMENT.md`](https://github.com/YEYVHAIOU/vllm-prefix-experiment/blob/main/docs/DEPLOYMENT.md) 配置 Python 环境、模型和 UCM 源码路径。
+
+完整系统启动入口：
+
+```bash
+bash deployment/scripts/start_full.sh
+```
+
+正式基准测试方法与结果：
+
+<https://github.com/YEYVHAIOU/vllm-prefix-experiment/blob/main/docs/BENCHMARK.md>
+
+## 运行环境
+
+最终验证环境为 RTX 4090、Python 3.12.3、PyTorch 2.8.0+cu129 和 CUDA Toolkit 12.8。运行时报告的 vLLM 包版本为：
+
+```text
+0.1.dev10+g05f00f8a8
+```
+
+该字符串来自构建阶段生成的 `_version.py`；源码身份以本页记录的 Git commit/tag 为准。
+
+## 当前边界
+
+Dynamic TTL 使用的基础 Prefill 曲线历史上来自 RTX 4060，项目在 RTX 4090 上完成过缩放敏感性分析，但没有重新完整拟合 4090 专用曲线。跨 GPU 使用时建议重新校准。
+
+UCM 上游显式支持的 vLLM 版本与本项目源码身份不同，因此联合运行依赖本项目额外完成的 KVConnector 生命周期与接口适配。详细修改见主项目：
+
+<https://github.com/YEYVHAIOU/vllm-prefix-experiment/blob/main/docs/COMPATIBILITY.md>
+
+## 上游与许可证
+
+本仓库建立在 vLLM 与 Continuum 相关开源代码基础上。原有许可证、版权声明和第三方 notice 应继续保留，并按照对应上游条款进行使用和再分发。
+
+本项目对上游代码的修改历史可通过 Git commit 和 tag 追溯。
